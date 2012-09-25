@@ -47,12 +47,13 @@
 #include <addrspace.h>
 #include <mainbus.h>
 #include <vnode.h>
-#include <pid.h>
-#include <file.h>
+#include <clock.h>
 
 #include "opt-synchprobs.h"
 #include "opt-defaultscheduler.h"
 
+/* Default time slice */
+time_t DEFAULT_TIME_SLICE[NUM_OF_PRIORITY_LEVELS]	= {100000, 100000}; // 100 micro secs
 
 /* Magic number used as a guard value on kernel thread stacks. */
 #define THREAD_STACK_MAGIC 0xbaadf00d
@@ -91,7 +92,7 @@ thread_checkstack_init(struct thread *thread)
 
 /*
  * Check the magic number we put on the bottom end of the stack in
- * thread_checkstack_init. If these KASSERTions go off, it most likely
+ * thread_checkstack_init. If these assertions go off, it most likely
  * means you overflowed your stack at some point, which can cause all
  * kinds of mysterious other things to happen.
  *
@@ -154,8 +155,17 @@ thread_create(const char *name)
 	/* VFS fields */
 	thread->t_cwd = NULL;
 
-  thread->t_pid = INVALID_PID;
-	thread->t_filetable = NULL;
+	/* If you add to struct thread, be sure to initialize here */
+	thread->t_fdt	= fdt_create();
+	//fdt_init(thread->t_fdt);
+	fdt_set(thread->t_fdt, NULL, 0);
+	fdt_set(thread->t_fdt, NULL, 1);
+	fdt_set(thread->t_fdt, NULL, 2);
+
+	thread->t_priority		= DEFAULT_PRIORITY_LEVEL;
+	thread->t_timeSliceLeft_ns	= DEFAULT_TIME_SLICE[thread->t_priority];
+	thread->t_startTimeStamp_s	= 0;
+	thread->t_startTimeStamp_ns	= 0;
 
 	return thread;
 }
@@ -174,6 +184,7 @@ cpu_create(unsigned hardware_number)
 	struct cpu *c;
 	int result;
 	char namebuf[16];
+	int i;
 
 	c = kmalloc(sizeof(*c));
 	if (c == NULL) {
@@ -189,6 +200,9 @@ cpu_create(unsigned hardware_number)
 
 	c->c_isidle = false;
 	threadlist_init(&c->c_runqueue);
+	for(i=0 ; i<NUM_OF_PRIORITY_LEVELS-1 ; i++) {
+		threadlist_init(&c->c_mlfqueue[i]);
+	}
 	spinlock_init(&c->c_runqueue_lock);
 
 	c->c_ipi_pending = 0;
@@ -254,7 +268,7 @@ thread_destroy(struct thread *thread)
 
 	/* VM fields, cleaned up in thread_exit */
 	KASSERT(thread->t_addrspace == NULL);
-	
+
 	/* Thread subsystem fields */
 	if (thread->t_stack != NULL) {
 		kfree(thread->t_stack);
@@ -264,8 +278,6 @@ thread_destroy(struct thread *thread)
 
 	/* sheer paranoia */
 	thread->t_wchan_name = "DESTROYED";
-
-  KASSERT(thread->t_filetable == NULL);
 
 	kfree(thread->t_name);
 	kfree(thread);
@@ -298,6 +310,7 @@ exorcise(void)
 void
 thread_panic(void)
 {
+	int i;
 	/*
 	 * Kill off other CPUs.
 	 *
@@ -315,7 +328,11 @@ thread_panic(void)
 	curcpu->c_runqueue.tl_count = 0;
 	curcpu->c_runqueue.tl_head.tln_next = NULL;
 	curcpu->c_runqueue.tl_tail.tln_prev = NULL;
-
+	for(i=0 ; i<NUM_OF_PRIORITY_LEVELS-1 ; i++) {
+		curcpu->c_mlfqueue[i].tl_count			= 0;
+		curcpu->c_mlfqueue[i].tl_head.tln_next	= NULL;
+		curcpu->c_mlfqueue[i].tl_tail.tln_prev 	= NULL;
+	}
 	/*
 	 * Ideally, we want to make sure sleeping threads don't wake
 	 * up and start running. However, there's no good way to track
@@ -357,8 +374,6 @@ thread_bootstrap(void)
 {
 	struct cpu *bootcpu;
 	struct thread *bootthread;
-	
-  pid_bootstrap();
 
 	cpuarray_init(&allcpus);
 
@@ -372,7 +387,6 @@ thread_bootstrap(void)
 	 */
 	bootcpu = cpu_create(0);
 	bootthread = bootcpu->c_curthread;
-	bootthread->t_pid = BOOTUP_PID;	/* special pid */
 
 	/*
 	 * Initializing curcpu and curthread is machine-dependent
@@ -403,24 +417,16 @@ thread_bootstrap(void)
 void
 cpu_hatch(unsigned software_number)
 {
-  int result;
-
 	KASSERT(curcpu != NULL);
 	KASSERT(curthread != NULL);
 	KASSERT(curcpu->c_number == software_number);
-
-  curthread->t_pid = BOOTUP_PID;
-  result = pid_alloc(&curthread->t_pid);
-  if (result) {
-    panic("PID allocation failure during boot.\n");
-  }
 
 	spl0();
 
 	kprintf("cpu%u: %s\n", software_number, cpu_identify());
 
 	V(cpu_startup_sem);
-	thread_exit(0);
+	thread_exit();
 }
 
 /*
@@ -467,7 +473,8 @@ thread_make_runnable(struct thread *target, bool already_have_lock)
 	}
 
 	isidle = targetcpu->c_isidle;
-	threadlist_addtail(&targetcpu->c_runqueue, target);
+	//threadlist_addtail(&targetcpu->c_runqueue, target);
+	push_scheduler(targetcpu, target);
 	if (isidle) {
 		/*
 		 * Other processor is idle; send interrupt to make
@@ -496,10 +503,9 @@ int
 thread_fork(const char *name,
 	    void (*entrypoint)(void *data1, unsigned long data2),
 	    void *data1, unsigned long data2,
-	    pid_t *childpid)
+	    struct thread **ret)
 {
 	struct thread *newthread;
-	int result;
 
 	newthread = thread_create(name);
 	if (newthread == NULL) {
@@ -520,49 +526,9 @@ thread_fork(const char *name,
 
 	/* Thread subsystem fields */
 	newthread->t_cpu = curthread->t_cpu;
-	
-	/* get the pid, and do its thang */
-	result = pid_alloc(&newthread->t_pid);
-	if (result) {
-		goto fail0;
-	}
-  
-  /* 
-	 * If we don't want the childpid, the new thread is not going to
-	 * live in a user process and doesn't need file handles or VM.
-	 */
 
-  if (childpid != NULL) {
-		/*
-		 * Copy stuff from the parent thread to the child.
-		 */
-		
-		if (curthread->t_filetable != NULL) {
-			result = filetable_copy(&newthread->t_filetable);
-			if (result) {
-				goto fail1;
-			}
-		}
-
-		if (curthread->t_addrspace) {
-			result = as_copy(curthread->t_addrspace, &newthread->t_addrspace);
-			if (result) {
-				goto fail2;
-			}
-		}
-	}
-	
-  /*
-	 * If the caller doesn't want to know what the child's pid
-	 * was, it must be because it's not interested in waiting for
-	 * it. So disown the child. Otherwise, report the pid.
-	 */
-	if (childpid == NULL) {
-		pid_disown(newthread->t_pid);
-	}
-	else {
-		*childpid = newthread->t_pid;
-	}
+	/* VM fields */
+	/* do not clone address space -- let caller decide on that */
 
 	/* VFS fields */
 	if (curthread->t_cwd != NULL) {
@@ -583,23 +549,17 @@ thread_fork(const char *name,
 	/* Lock the current cpu's run queue and make the new thread runnable */
 	thread_make_runnable(newthread, false);
 
-	return 0;
- 
-fail2:
-	if (newthread->t_filetable) {
-		filetable_destroy(newthread->t_filetable);
-		newthread->t_filetable = NULL;
-	}
- 
-fail1:
-	if (newthread->t_pid != INVALID_PID) {
-		pid_unalloc(newthread->t_pid);
-		newthread->t_pid = INVALID_PID;
+	/*
+	 * Return new thread structure if it's wanted. Note that using
+	 * the thread structure from the parent thread should be done
+	 * only with caution, because in general the child thread
+	 * might exit at any time.
+	 */
+	if (ret != NULL) {
+		*ret = newthread;
 	}
 
-fail0:
-	thread_destroy(newthread);
-	return result;
+	return 0;
 }
 
 /*
@@ -617,6 +577,8 @@ thread_switch(threadstate_t newstate, struct wchan *wc)
 {
 	struct thread *cur, *next;
 	int spl;
+	time_t seconds;
+	uint32_t nanoseconds;
 
 	DEBUGASSERT(curcpu->c_curthread == curthread);
 	DEBUGASSERT(curthread->t_cpu == curcpu->c_self);
@@ -646,6 +608,16 @@ thread_switch(threadstate_t newstate, struct wchan *wc)
 		spinlock_release(&curcpu->c_runqueue_lock);
 		splx(spl);
 		return;
+	}
+
+	// update time slice
+	gettime(&seconds, &nanoseconds);
+	seconds					= seconds 	  - cur->t_startTimeStamp_s;
+	nanoseconds				= nanoseconds - cur->t_startTimeStamp_ns;
+	cur->t_timeSliceLeft_ns	= (cur->t_timeSliceLeft_ns - seconds*1000000000 - nanoseconds);
+	if(cur->t_timeSliceLeft_ns	< 0) {
+		cur->t_priority = cur->t_priority - 1;
+		cur->t_priority = (cur->t_priority < 0) ? 0 : cur->t_priority;
 	}
 
 	/* Put the thread in the right place. */
@@ -700,7 +672,8 @@ thread_switch(threadstate_t newstate, struct wchan *wc)
 	/* The current cpu is now idle. */
 	curcpu->c_isidle = true;
 	do {
-		next = threadlist_remhead(&curcpu->c_runqueue);
+		//next = threadlist_remhead(&curcpu->c_runqueue);
+		next = pop_scheduler(curcpu);
 		if (next == NULL) {
 			spinlock_release(&curcpu->c_runqueue_lock);
 			cpu_idle();
@@ -772,6 +745,7 @@ thread_switch(threadstate_t newstate, struct wchan *wc)
 	/* Clear the wait channel and set the thread state. */
 	cur->t_wchan_name = NULL;
 	cur->t_state = S_RUN;
+	gettime(&cur->t_startTimeStamp_s, &cur->t_startTimeStamp_ns);
 
 	/* Unlock the run queue. */
 	spinlock_release(&curcpu->c_runqueue_lock);
@@ -807,6 +781,7 @@ thread_startup(void (*entrypoint)(void *data1, unsigned long data2),
 	/* Clear the wait channel and set the thread state. */
 	cur->t_wchan_name = NULL;
 	cur->t_state = S_RUN;
+	gettime(&cur->t_startTimeStamp_s, &cur->t_startTimeStamp_ns);
 
 	/* Release the runqueue lock acquired in thread_switch. */
 	spinlock_release(&curcpu->c_runqueue_lock);
@@ -837,7 +812,7 @@ thread_startup(void (*entrypoint)(void *data1, unsigned long data2),
 	entrypoint(data1, data2);
 
 	/* Done. */
-	thread_exit(0);
+	thread_exit();
 }
 
 /*
@@ -850,24 +825,16 @@ thread_startup(void (*entrypoint)(void *data1, unsigned long data2),
  * Does not return.
  */
 void
-thread_exit(int exitstatus)
+thread_exit(void)
 {
 	struct thread *cur;
-	
+
 	cur = curthread;
-  
-  /* SOL2: set exit status and wake up anyone waiting for us */
-	pid_setexitstatus(exitstatus);
 
 	/* VFS fields */
 	if (cur->t_cwd) {
 		VOP_DECREF(cur->t_cwd);
 		cur->t_cwd = NULL;
-	}
-	
-	if (curthread->t_filetable) {
-		filetable_destroy(curthread->t_filetable);
-		curthread->t_filetable = NULL;
 	}
 
 	/* VM fields */
@@ -921,8 +888,64 @@ schedule(void)
 void
 schedule(void)
 {
-  // 28 Feb 2012 : GWA : Implement your scheduler that prioritizes
-  // "interactive" threads here.
+	struct cpu *targetCpu;
+	struct thread *itrVal;
+	int i;
+
+	/* Explicitly disable interrupts on this processor */
+	spinlock_acquire(&(curcpu->c_runqueue_lock));
+
+	// move all threads to runqueue and reset timeslice and priority
+	targetCpu	= curcpu;
+	// for mlfqueue
+	for(i=NUM_OF_PRIORITY_LEVELS-2 ; i>=0 ; i--) {
+		do {
+			itrVal	= threadlist_remhead(&targetCpu->c_mlfqueue[i]);
+			if(itrVal != NULL) {
+				itrVal->t_priority			= MAX_PRIORITY_LEVEL;
+				itrVal->t_timeSliceLeft_ns	= DEFAULT_TIME_SLICE[MAX_PRIORITY_LEVEL];
+				push_scheduler(targetCpu, itrVal);
+			}
+		}while(itrVal != NULL);
+	}
+
+	/* Turn interrupts back on. */
+	spinlock_release(&(curcpu->c_runqueue_lock));
+}
+#endif
+
+#if OPT_DEFAULTSCHEDULER
+void push_scheduler(struct cpu *targetCpu, struct thread *targetThread) {
+	threadlist_addtail(&targetCpu->c_runqueue, targetThread);
+}
+#else
+void push_scheduler(struct cpu *targetCpu, struct thread *targetThread) {
+	int curPriority	= targetThread->t_priority;
+
+	if(curPriority == MAX_PRIORITY_LEVEL)
+		threadlist_addtail(&targetCpu->c_runqueue, targetThread);
+	else
+		threadlist_addtail(&targetCpu->c_mlfqueue[curPriority-1], targetThread);
+}
+#endif
+
+#if OPT_DEFAULTSCHEDULER
+struct thread* pop_scheduler(struct cpu *targetCpu) {
+	return threadlist_remhead(&targetCpu->c_runqueue);
+}
+#else
+struct thread* pop_scheduler(struct cpu *targetCpu) {
+	struct thread* retVal;
+	int i;
+
+	retVal	= threadlist_remhead(&targetCpu->c_runqueue);
+	if(retVal == NULL) {
+		for(i=NUM_OF_PRIORITY_LEVELS-2 ; retVal==NULL && i>=0 ; i--) {
+			retVal	= threadlist_remhead(&targetCpu->c_mlfqueue[i]);
+		}
+	}
+
+	return retVal;
 }
 #endif
 
